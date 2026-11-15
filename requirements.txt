@@ -2,5 +2,5 @@ streamlit
 opencv-python-headless
 numpy
 pillow
-torch
-transformers
+onnxruntime
+huggingface_hub
