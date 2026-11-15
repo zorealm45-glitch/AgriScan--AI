@@ -2,9 +2,6 @@ import streamlit as st
 import cv2
 import numpy as np
 from PIL import Image
-import onnxruntime as ort
-from huggingface_hub import hf_hub_download
-import json
 
 st.set_page_config(
     page_title="AgriScan-AI | High-Precision Produce & Edibility Diagnostics",
@@ -85,120 +82,47 @@ st.markdown("""
 SAFE_EDIBLE_BENCHMARK = 80.0
 OPTIMAL_FRESH_AVERAGE = 92.0
 
-# --- Ultra-Lightweight ONNX Deep Neural Network (14 MB, < 80 MB RAM) ---
-@st.cache_resource
-def load_onnx_classifier():
-    model_path = hf_hub_download(
-        repo_id="onnx-community/mobilenetv2_100.ra_in1k",
-        filename="onnx/model.onnx"
-    )
-    labels_path = hf_hub_download(
-        repo_id="huggingface/label-files",
-        filename="imagenet-1k-id2label.json",
-        repo_type="dataset"
-    )
-    with open(labels_path, "r") as f:
-        id2label = json.load(f)
-    session = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
-    return session, id2label
-
-ort_session, id2label = load_onnx_classifier()
-
-# Mapping ImageNet classes + visual cues to clean Fruit & Vegetable names
-IMAGENET_TO_PRODUCE = {
-    "granny smith": ("Apple", "Fruit"),
-    "banana": ("Banana", "Fruit"),
-    "orange": ("Orange", "Fruit"),
-    "lemon": ("Lemon", "Fruit"),
-    "fig": ("Fig", "Fruit"),
-    "pineapple": ("Pineapple", "Fruit"),
-    "strawberry": ("Strawberry", "Fruit"),
-    "pomegranate": ("Pomegranate", "Fruit"),
-    "custard apple": ("Guava / Custard Apple", "Fruit"),
-    "jackfruit": ("Jackfruit", "Fruit"),
-    "bell pepper": ("Bell Pepper", "Vegetable"),
-    "cucumber": ("Cucumber", "Vegetable"),
-    "zucchini": ("Zucchini", "Vegetable"),
-    "spaghetti squash": ("Squash", "Vegetable"),
-    "acorn squash": ("Squash", "Vegetable"),
-    "butternut squash": ("Butternut Squash", "Vegetable"),
-    "broccoli": ("Broccoli", "Vegetable"),
-    "cauliflower": ("Cauliflower", "Vegetable"),
-    "head cabbage": ("Cabbage", "Vegetable"),
-    "artichoke": ("Artichoke", "Vegetable"),
-    "cardoon": ("Celery / Cardoon", "Vegetable"),
-    "mushroom": ("Mushroom", "Vegetable"),
-    "corn": ("Corn", "Vegetable"),
-    "ear": ("Corn", "Vegetable"),
-    "mashed potato": ("Potato", "Vegetable"),
-    "hotdog": ("Carrot / Sausage", "Vegetable"),
-    "hip": ("Tomato / Rosehip", "Vegetable"),
-    "puck": ("Plum / Fig", "Fruit"),
-    "tennis ball": ("Guava / Lime", "Fruit"),
-    "ping-pong ball": ("Lychee / Egg", "Fruit"),
-    "croquet ball": ("Apple / Peach", "Fruit")
-}
-
-# Detailed HSV + Shape + Texture Botanical Database for High-Precision Disambiguation
-BOTANICAL_SIGNATURES = {
+# High-Precision Multi-Feature Botanical Database:
+# (Name, Primary_Hue_Range, Secondary_Hue_Range, Sat_Range, Val_Range, Circularity, Aspect_Ratio, Solidity, Texture_Index)
+BOTANICAL_DB = {
     "Fruit": [
-        # (Name, Hue_Min, Hue_Max, Sat_Min, Val_Min, Circularity_Ideal, Aspect_Ideal, Smoothness_Ideal)
-        ("Guava", 24, 52, 45, 95, 0.84, 0.92, 220),
-        ("Green Apple", 32, 58, 70, 90, 0.88, 0.98, 120),
-        ("Red Apple", 0, 11, 90, 75, 0.88, 0.98, 130),
-        ("Banana", 18, 31, 95, 110, 0.40, 0.42, 160),
-        ("Orange", 10, 19, 130, 120, 0.92, 0.98, 380),
-        ("Lemon", 22, 33, 120, 130, 0.74, 0.72, 290),
-        ("Lime", 36, 65, 100, 80, 0.82, 0.84, 280),
-        ("Mango", 13, 30, 90, 100, 0.68, 0.68, 150),
-        ("Strawberry", 0, 9, 120, 80, 0.72, 0.82, 520),
-        ("Pomegranate", 0, 12, 85, 70, 0.86, 0.95, 240),
-        ("Watermelon", 38, 78, 60, 50, 0.85, 0.88, 210),
-        ("Pear", 23, 44, 65, 95, 0.68, 0.70, 180),
-        ("Peach", 8, 20, 85, 105, 0.88, 0.96, 200),
-        ("Grape", 120, 168, 50, 45, 0.62, 0.75, 260)
+        ("Guava", (24, 52), (18, 35), (45, 165), (95, 235), 0.83, 0.90, 0.96, 220),
+        ("Green Apple", (34, 62), (25, 45), (75, 210), (90, 230), 0.89, 0.98, 0.97, 115),
+        ("Red Apple", (0, 11), (168, 180), (95, 245), (70, 220), 0.89, 0.98, 0.97, 125),
+        ("Banana", (19, 31), (14, 24), (105, 245), (115, 245), 0.38, 0.40, 0.84, 155),
+        ("Orange", (10, 19), (15, 24), (140, 255), (125, 250), 0.92, 0.98, 0.98, 390),
+        ("Lemon", (23, 33), (20, 30), (130, 255), (135, 255), 0.74, 0.72, 0.94, 290),
+        ("Lime", (38, 68), (30, 55), (105, 240), (75, 200), 0.82, 0.84, 0.95, 280),
+        ("Mango", (13, 30), (30, 50), (95, 240), (100, 240), 0.68, 0.68, 0.94, 145),
+        ("Strawberry", (0, 9), (170, 180), (125, 255), (80, 225), 0.72, 0.82, 0.93, 540),
+        ("Pomegranate", (0, 12), (165, 180), (85, 215), (65, 200), 0.86, 0.95, 0.96, 240),
+        ("Watermelon", (40, 80), (30, 55), (60, 200), (45, 175), 0.85, 0.88, 0.97, 210),
+        ("Pear", (23, 44), (18, 35), (65, 190), (95, 230), 0.67, 0.69, 0.92, 180),
+        ("Peach", (8, 21), (15, 28), (90, 225), (105, 235), 0.88, 0.96, 0.97, 200),
+        ("Grape", (120, 168), (35, 65), (50, 195), (40, 180), 0.62, 0.75, 0.86, 260)
     ],
     "Vegetable": [
-        ("Tomato", 0, 11, 115, 95, 0.90, 0.98, 110),
-        ("Cucumber", 36, 78, 65, 45, 0.34, 0.28, 250),
-        ("Potato", 13, 27, 45, 80, 0.76, 0.74, 340),
-        ("Carrot", 8, 19, 130, 110, 0.36, 0.30, 310),
-        ("Green Bell Pepper", 35, 78, 85, 55, 0.76, 0.86, 140),
-        ("Red Bell Pepper", 0, 10, 130, 90, 0.76, 0.86, 140),
-        ("Yellow Bell Pepper", 19, 32, 130, 120, 0.76, 0.86, 140),
-        ("Eggplant", 125, 168, 55, 30, 0.54, 0.50, 120),
-        ("Broccoli", 40, 82, 70, 40, 0.64, 0.90, 850),
-        ("Onion", 11, 25, 55, 90, 0.85, 0.92, 230),
-        ("Zucchini", 38, 76, 65, 45, 0.38, 0.32, 210),
-        ("Garlic", 15, 35, 15, 150, 0.82, 0.90, 290)
+        ("Tomato", (0, 11), (168, 180), (120, 255), (90, 230), 0.90, 0.98, 0.97, 110),
+        ("Cucumber", (38, 80), (30, 55), (65, 210), (40, 175), 0.33, 0.27, 0.91, 250),
+        ("Potato", (13, 27), (10, 22), (40, 135), (80, 205), 0.76, 0.74, 0.94, 340),
+        ("Carrot", (8, 19), (12, 24), (135, 255), (110, 240), 0.35, 0.29, 0.90, 310),
+        ("Green Bell Pepper", (36, 80), (28, 50), (85, 235), (50, 195), 0.76, 0.86, 0.91, 135),
+        ("Red Bell Pepper", (0, 10), (170, 180), (135, 255), (85, 225), 0.76, 0.86, 0.91, 135),
+        ("Yellow Bell Pepper", (19, 32), (15, 28), (135, 255), (120, 245), 0.76, 0.86, 0.91, 135),
+        ("Eggplant", (125, 168), (110, 145), (55, 210), (25, 130), 0.54, 0.50, 0.92, 115),
+        ("Broccoli", (40, 84), (32, 60), (70, 210), (35, 165), 0.64, 0.90, 0.85, 860),
+        ("Onion", (11, 25), (140, 175), (50, 165), (90, 225), 0.85, 0.92, 0.95, 230),
+        ("Zucchini", (38, 78), (30, 52), (65, 205), (45, 180), 0.38, 0.32, 0.92, 210),
+        ("Garlic", (15, 35), (0, 180), (12, 65), (150, 245), 0.82, 0.90, 0.93, 290)
     ]
 }
-
-def predict_onnx_top5(pil_image):
-    img = pil_image.convert("RGB").resize((224, 224))
-    arr = np.array(img, dtype=np.float32) / 255.0
-    mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-    std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
-    arr = (arr - mean) / std
-    arr = np.transpose(arr, (2, 0, 1))[None, ...]
-
-    input_name = ort_session.get_inputs()[0].name
-    logits = ort_session.run(None, {input_name: arr})[0][0]
-    exp_logits = np.exp(logits - np.max(logits))
-    probs = exp_logits / np.sum(exp_logits)
-
-    top_indices = np.argsort(probs)[::-1][:8]
-    results = []
-    for idx in top_indices:
-        label = id2label[str(int(idx))].split(",")[0].strip().lower()
-        results.append((label, float(probs[idx]) * 100.0))
-    return results
 
 def focus_and_clarify_image(pil_image):
     img_rgb = np.array(pil_image.convert("RGB"))
     bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
     bgr_std = cv2.resize(bgr, (400, 400))
 
+    # GrabCut central subject isolation (suppresses cluttered backgrounds & people)
     mask = np.zeros((400, 400), np.uint8)
     bgd_model = np.zeros((1, 65), np.float64)
     fgd_model = np.zeros((1, 65), np.float64)
@@ -227,7 +151,6 @@ def focus_and_clarify_image(pil_image):
 
     alpha = (fg_mask_255.astype(np.float32) / 255.0)[:, :, None]
     focused_true_bgr = (sharp_true_bgr.astype(np.float32) * alpha + blurred_bg.astype(np.float32) * (1.0 - alpha)).astype(np.uint8)
-    focused_true_pil = Image.fromarray(cv2.cvtColor(focused_true_bgr, cv2.COLOR_BGR2RGB))
 
     lab = cv2.cvtColor(focused_true_bgr, cv2.COLOR_BGR2LAB)
     l_ch, a_ch, b_ch = cv2.split(lab)
@@ -235,74 +158,75 @@ def focus_and_clarify_image(pil_image):
     clarified_bgr = cv2.cvtColor(cv2.merge((clahe.apply(l_ch), a_ch, b_ch)), cv2.COLOR_LAB2BGR)
     clarified_pil = Image.fromarray(cv2.cvtColor(clarified_bgr, cv2.COLOR_BGR2RGB))
 
-    return focused_true_bgr, focused_true_pil, clarified_pil, fg_mask_255
+    return focused_true_bgr, clarified_pil, fg_mask_255
 
-def high_accuracy_species_fusion(onnx_preds, mean_hue, mean_sat, mean_val, circularity, aspect_ratio, laplacian_var, category_choice, optional_name):
+def classify_produce_high_precision(hsv, mask_clean, circularity, aspect_ratio, solidity, laplacian_var, category_choice, optional_name):
     if optional_name.strip():
         clean_name = optional_name.strip().title()
         return True, clean_name, 99.0, [(clean_name, 99.0)]
 
-    # 1. Check if ONNX detected a clear produce class
-    onnx_boost = {}
-    is_food_by_nn = False
-    for label, prob in onnx_preds:
-        for key, (mapped_name, mapped_cat) in IMAGENET_TO_PRODUCE.items():
-            if key in label:
-                is_food_by_nn = True
-                # Boost matching category strongly
-                weight = 1.35 if mapped_cat == category_choice else 0.65
-                onnx_boost[mapped_name] = onnx_boost.get(mapped_name, 0.0) + (prob * weight)
+    valid_pixels = hsv[mask_clean > 0]
+    if len(valid_pixels) < 800:
+        return False, "Empty / Unclear Frame", 0.0, []
 
-    # Reject completely non-food objects (e.g., laptops, phones, faces, walls)
-    non_food_blocklist = {"laptop", "notebook", "cellular telephone", "monitor", "screen", "keyboard", "mouse", "wall", "suit", "jersey", "car", "wheel", "shoe"}
-    top_nn_label = onnx_preds[0][0]
-    top_nn_prob = onnx_preds[0][1]
-    if any(nf in top_nn_label for nf in non_food_blocklist) and top_nn_prob > 35.0 and not is_food_by_nn:
-        return False, top_nn_label.title(), round(top_nn_prob, 1), []
+    # Compute Dominant Hue (Circular Histogram Peak) & Secondary Hue
+    hues = valid_pixels[:, 0]
+    sats = valid_pixels[:, 1]
+    vals = valid_pixels[:, 2]
 
-    if mean_sat < 22 and not is_food_by_nn and category_choice == "Fruit":
-        return False, "Unrecognized / Non-Food Object", 85.0, []
+    mean_sat = float(np.mean(sats))
+    mean_val = float(np.mean(vals))
 
-    # 2. Score every candidate in the selected category using Botanical Signature + ONNX Neural Boost
-    candidates = BOTANICAL_SIGNATURES[category_choice]
+    # Reject colorless/non-food objects (walls, screens, metal, paper)
+    if mean_sat < 22 and category_choice == "Fruit":
+        return False, "Non-Food / Colorless Object", 88.0, []
+
+    hist, _ = np.histogram(hues, bins=36, range=(0, 180))
+    dominant_bin = int(np.argmax(hist))
+    dominant_hue = (dominant_bin * 5) + 2.5
+
+    # Check if 25th-75th percentile spread is overly chaotic (typical of non-produce clutter)
+    hue_std = float(np.std(hues))
+    if hue_std > 62.0 and mean_sat < 45:
+        return False, "Cluttered Non-Produce Scene", 82.0, []
+
+    candidates = BOTANICAL_DB[category_choice]
     norm_aspect = min(aspect_ratio, 1.0 / max(aspect_ratio, 0.01))
-    final_scores = []
+    scored_list = []
 
-    for name, h_min, h_max, s_min, v_min, c_ideal, a_ideal, tex_ideal in candidates:
-        # Hue accuracy score (40%)
-        if h_min <= mean_hue <= h_max:
+    for name, (h1_min, h1_max), (h2_min, h2_max), (s_min, s_max), (v_min, v_max), c_id, a_id, sol_id, tex_id in candidates:
+        # 1. Dominant & Secondary Hue Match (45%)
+        if h1_min <= dominant_hue <= h1_max:
             hue_sc = 1.0
+        elif h2_min <= dominant_hue <= h2_max:
+            hue_sc = 0.85
         else:
-            dist = min(abs(mean_hue - h_min), abs(mean_hue - h_max))
-            hue_sc = max(0.0, 1.0 - (dist / 35.0))
+            d1 = min(abs(dominant_hue - h1_min), abs(dominant_hue - h1_max))
+            d2 = min(abs(dominant_hue - h2_min), abs(dominant_hue - h2_max))
+            dist = min(d1, d2)
+            hue_sc = max(0.0, 1.0 - (dist / 32.0))
 
-        # Saturation & Brightness match (15%)
-        sat_sc = 1.0 if mean_sat >= s_min else max(0.2, mean_sat / max(s_min, 1))
-        val_sc = 1.0 if mean_val >= v_min else max(0.2, mean_val / max(v_min, 1))
-        color_sc = (0.6 * sat_sc) + (0.4 * val_sc)
+        # 2. Saturation & Brightness Range Match (15%)
+        sat_sc = 1.0 if s_min <= mean_sat <= s_max else max(0.2, 1.0 - min(abs(mean_sat - s_min), abs(mean_sat - s_max)) / 100.0)
+        val_sc = 1.0 if v_min <= mean_val <= v_max else max(0.2, 1.0 - min(abs(mean_val - v_min), abs(mean_val - v_max)) / 100.0)
+        sv_sc = (0.6 * sat_sc) + (0.4 * val_sc)
 
-        # Geometry: Circularity + Aspect Ratio (25%)
-        circ_sc = max(0.0, 1.0 - abs(circularity - c_ideal) * 1.4)
-        asp_sc = max(0.0, 1.0 - abs(norm_aspect - a_ideal) * 1.4)
-        geom_sc = (0.55 * circ_sc) + (0.45 * asp_sc)
+        # 3. Morphological Geometry: Circularity + Aspect Ratio + Solidity (28%)
+        circ_sc = max(0.0, 1.0 - abs(circularity - c_id) * 1.45)
+        asp_sc = max(0.0, 1.0 - abs(norm_aspect - a_id) * 1.45)
+        sol_sc = max(0.0, 1.0 - abs(solidity - sol_id) * 2.0)
+        geom_sc = (0.45 * circ_sc) + (0.35 * asp_sc) + (0.20 * sol_sc)
 
-        # Surface Texture match (10%)
-        tex_sc = max(0.0, 1.0 - abs(laplacian_var - tex_ideal) / 800.0)
+        # 4. Surface Texture Signature (12%)
+        tex_sc = max(0.0, 1.0 - abs(laplacian_var - tex_id) / 750.0)
 
-        # Neural Network Semantic Boost (10% + direct bonus if matched)
-        nn_bonus = 0.0
-        for b_name, b_val in onnx_boost.items():
-            if name.lower() in b_name.lower() or b_name.lower() in name.lower():
-                nn_bonus = min(35.0, b_val * 0.65)
+        total_score = round(((0.45 * hue_sc) + (0.15 * sv_sc) + (0.28 * geom_sc) + (0.12 * tex_sc)) * 100.0, 1)
+        scored_list.append((name, total_score))
 
-        base_pct = ((0.42 * hue_sc) + (0.18 * color_sc) + (0.28 * geom_sc) + (0.12 * tex_sc)) * 100.0
-        total_pct = round(min(99.2, base_pct + nn_bonus), 1)
-        final_scores.append((name, total_pct))
+    scored_list.sort(key=lambda x: x[1], reverse=True)
+    return True, scored_list[0][0], scored_list[0][1], scored_list[:3]
 
-    final_scores.sort(key=lambda x: x[1], reverse=True)
-    return True, final_scores[0][0], final_scores[0][1], final_scores[:3]
-
-def analyze_produce(focused_bgr, focused_pil, mask_clean, category_choice, optional_name):
+def analyze_produce(focused_bgr, mask_clean, category_choice, optional_name):
     hsv = cv2.cvtColor(focused_bgr, cv2.COLOR_BGR2HSV)
     gray = cv2.cvtColor(focused_bgr, cv2.COLOR_BGR2GRAY)
 
@@ -326,24 +250,22 @@ def analyze_produce(focused_bgr, focused_pil, mask_clean, category_choice, optio
             cv2.rectangle(annotated_img, (x, y), (x + w, y + h), (46, 204, 113), 2)
             cv2.drawContours(annotated_img, [largest], -1, (52, 152, 219), 2)
 
-    valid_pixels = hsv[mask_clean > 0]
-    if len(valid_pixels) < 800 or object_area < 1200:
-        return {"is_edible_object": False, "detected_name": "Empty / Unclear Frame", "match_conf": 0.0}
-
-    mean_hue = float(np.mean(valid_pixels[:, 0]))
-    mean_sat = float(np.mean(valid_pixels[:, 1]))
-    mean_val = float(np.mean(valid_pixels[:, 2]))
+    if object_area < 1200:
+        return {"is_edible_object": False, "detected_name": "No Produce Detected", "match_conf": 0.0}
 
     masked_gray = cv2.bitwise_and(gray, gray, mask=mask_clean)
     laplacian_var = round(cv2.Laplacian(masked_gray, cv2.CV_64F).var(), 1)
 
-    onnx_preds = predict_onnx_top5(focused_pil)
-    is_edible_obj, detected_name, match_conf, top3_matches = high_accuracy_species_fusion(
-        onnx_preds, mean_hue, mean_sat, mean_val, circularity, aspect_ratio, laplacian_var, category_choice, optional_name
+    is_edible_obj, detected_name, match_conf, top3_matches = classify_produce_high_precision(
+        hsv, mask_clean, circularity, aspect_ratio, solidity, laplacian_var, category_choice, optional_name
     )
 
     if not is_edible_obj:
         return {"is_edible_object": False, "detected_name": detected_name, "match_conf": match_conf}
+
+    valid_pixels = hsv[mask_clean > 0]
+    mean_sat = float(np.mean(valid_pixels[:, 1]))
+    mean_val = float(np.mean(valid_pixels[:, 2]))
 
     # 1. Surface Bad Marks / Minor Bruises (Orange highlight)
     blemish_mask = cv2.inRange(hsv, np.array([8, 35, 38]), np.array([26, 220, 118]))
@@ -442,7 +364,7 @@ def analyze_produce(focused_bgr, focused_pil, mask_clean, category_choice, optio
 # --- Sidebar ---
 with st.sidebar:
     st.title("🌿 AgriScan-AI")
-    st.caption("Hybrid ONNX Neural + Botanical Vision Diagnostics")
+    st.caption("Botanical Multi-Feature Produce & Edibility Diagnostics")
     st.divider()
     st.markdown(f"""
     **Edibility Standard Benchmarks:**
@@ -462,7 +384,7 @@ with st.sidebar:
 
 # --- Main Interface ---
 st.title("🌿 AgriScan-AI: High-Precision Produce & Edibility Inspector")
-st.write("Select your produce category, optionally type its name, capture or upload a photo, and click the confirmation button to start the AI inspection.")
+st.write("Select your produce category, optionally type its name, capture or upload a photo, and click the confirmation button to start the inspection.")
 
 # --- STEP 1: Category + Optional Produce Name ---
 st.subheader("Step 1: Produce Details")
@@ -510,7 +432,7 @@ if image_file is not None:
         st.markdown(f"""
         **Ready to Analyze:**
         - **Category:** {clean_category}
-        - **Produce Name:** `{optional_produce_name.strip().title() if optional_produce_name.strip() else "High-Accuracy AI Auto-Detect"}`
+        - **Produce Name:** `{optional_produce_name.strip().title() if optional_produce_name.strip() else "High-Precision Auto-Detect"}`
         
         Click the confirmation button below to isolate the produce, identify its exact species, and check edibility.
         """)
@@ -519,9 +441,9 @@ if image_file is not None:
 
     if st.session_state.get("confirmed_scan", False):
         st.divider()
-        with st.spinner("Isolating produce, running ONNX Neural + Botanical classification, and scanning defects..."):
-            focused_true_bgr, focused_true_pil, clarified_display_pil, fg_mask = focus_and_clarify_image(pil_img)
-            res = analyze_produce(focused_true_bgr, focused_true_pil, fg_mask, clean_category, optional_produce_name)
+        with st.spinner("Isolating produce, extracting botanical features, and scanning defects..."):
+            focused_true_bgr, clarified_display_pil, fg_mask = focus_and_clarify_image(pil_img)
+            res = analyze_produce(focused_true_bgr, fg_mask, clean_category, optional_produce_name)
 
         if not res["is_edible_object"]:
             st.error(f"🚨 ERROR ANNOUNCEMENT: NOT EDIBLE! Detected '{res['detected_name']}', which is NOT an edible {clean_category.lower()}.")
@@ -540,7 +462,7 @@ if image_file is not None:
 
             st.subheader("Diagnostic & Edibility Benchmark Summary")
             c1, c2, c3, c4 = st.columns(4)
-            name_source_label = "User Specified" if optional_produce_name.strip() else f"{res['match_conf']}% AI confidence"
+            name_source_label = "User Specified" if optional_produce_name.strip() else f"{res['match_conf']}% botanical match"
             c1.metric(f"Detected {clean_category}", detected_name, name_source_label)
             c2.metric("Edibility Score", f"{res['edibility_pct']}%", f"{res['diff_benchmark']}% vs Safe Avg")
             c3.metric("Safe Edible Average", f"{SAFE_EDIBLE_BENCHMARK}%", f"Usable Flesh: {res['usable_flesh_pct']}%")
