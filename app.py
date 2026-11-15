@@ -4,9 +4,9 @@ import numpy as np
 from PIL import Image
 import urllib.request
 import os
-import mediapipe as mp
-from mediapipe.tasks import python
-from mediapipe.tasks.python import vision
+import json
+import torch
+import timm
 
 st.set_page_config(
     page_title="AgriScan-AI | High-Precision Produce & Edibility Diagnostics",
@@ -87,20 +87,26 @@ st.markdown("""
 SAFE_EDIBLE_BENCHMARK = 80.0
 OPTIMAL_FRESH_AVERAGE = 92.0
 
-# --- Load Ultra-Fast Google MediaPipe EfficientNet-Lite0 CNN (4.5 MB, Zero Crash) ---
+# --- Load Ultra-Lightweight MobileNetV3-Small CNN (10 MB, Python 3.14 Native) ---
 @st.cache_resource
-def load_mediapipe_classifier():
-    model_path = "efficientnet_lite0.tflite"
-    if not os.path.exists(model_path):
-        url = "https://storage.googleapis.com/mediapipe-models/image_classifier/efficientnet_lite0/float32/1/efficientnet_lite0.tflite"
-        urllib.request.urlretrieve(url, model_path)
-    base_options = python.BaseOptions(model_asset_path=model_path)
-    options = vision.ImageClassifierOptions(base_options=base_options, max_results=8)
-    return vision.ImageClassifier.create_from_options(options)
+def load_cnn_model():
+    model = timm.create_model("mobilenetv3_small_100", pretrained=True)
+    model.eval()
+    data_config = timm.data.resolve_model_data_config(model)
+    transforms = timm.data.create_transform(**data_config, is_training=False)
 
-classifier = load_mediapipe_classifier()
+    labels_file = "imagenet_class_index.json"
+    if not os.path.exists(labels_file):
+        url = "https://storage.googleapis.com/download.tensorflow.org/data/imagenet_class_index.json"
+        urllib.request.urlretrieve(url, labels_file)
+    with open(labels_file, "r") as f:
+        raw_idx = json.load(f)
+    id2label = {int(k): v[1].replace("_", " ").lower() for k, v in raw_idx.items()}
+    return model, transforms, id2label
 
-# Map ImageNet CNN labels to clean Fruit / Vegetable names
+cnn_model, cnn_transforms, id2label = load_cnn_model()
+
+# Map ImageNet CNN labels to clean Fruit & Vegetable names
 CNN_PRODUCE_MAP = {
     "granny smith": ("Apple", "Fruit"),
     "apple": ("Apple", "Fruit"),
@@ -171,7 +177,7 @@ def focus_and_clarify_image(pil_image):
 
     alpha = (fg_mask_255.astype(np.float32) / 255.0)[:, :, None]
     focused_true_bgr = (sharp_true_bgr.astype(np.float32) * alpha + blurred_bg.astype(np.float32) * (1.0 - alpha)).astype(np.uint8)
-    focused_true_rgb = cv2.cvtColor(focused_true_bgr, cv2.COLOR_BGR2RGB)
+    focused_true_pil = Image.fromarray(cv2.cvtColor(focused_true_bgr, cv2.COLOR_BGR2RGB))
 
     lab = cv2.cvtColor(focused_true_bgr, cv2.COLOR_BGR2LAB)
     l_ch, a_ch, b_ch = cv2.split(lab)
@@ -179,23 +185,24 @@ def focus_and_clarify_image(pil_image):
     clarified_bgr = cv2.cvtColor(cv2.merge((clahe.apply(l_ch), a_ch, b_ch)), cv2.COLOR_LAB2BGR)
     clarified_pil = Image.fromarray(cv2.cvtColor(clarified_bgr, cv2.COLOR_BGR2RGB))
 
-    return focused_true_bgr, focused_true_rgb, clarified_pil, fg_mask_255
+    return focused_true_bgr, focused_true_pil, clarified_pil, fg_mask_255
 
-def classify_with_cnn_and_morphology(focused_rgb, hsv, mask_clean, circularity, aspect_ratio, category_choice, optional_name):
+def classify_with_cnn_and_morphology(focused_pil, hsv, mask_clean, circularity, aspect_ratio, category_choice, optional_name):
     if optional_name.strip():
         clean_name = optional_name.strip().title()
         return True, clean_name, 99.0, [(clean_name, 99.0)]
 
-    # Run EfficientNet-Lite0 CNN on the focused RGB image
-    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=focused_rgb)
-    classification_result = classifier.classify(mp_image)
-    categories = classification_result.classifications[0].categories
+    # Run MobileNetV3 CNN inference
+    tensor_img = cnn_transforms(focused_pil).unsqueeze(0)
+    with torch.no_grad():
+        logits = cnn_model(tensor_img)
+        probs = torch.softmax(logits, dim=1)[0]
+        top_probs, top_idxs = torch.topk(probs, k=10)
 
-    raw_preds = [(c.category_name.lower(), round(c.score * 100, 1)) for c in categories]
+    raw_preds = [(id2label[int(idx)], round(float(p) * 100, 1)) for p, idx in zip(top_probs, top_idxs)]
 
-    # Check if top prediction is explicitly a non-food object
     top_raw_name, top_raw_score = raw_preds[0]
-    has_produce_match = any(any(k in lbl for k in CNN_PRODUCE_MAP) for lbl, _ in raw_preds[:5])
+    has_produce_match = any(any(k in lbl for k in CNN_PRODUCE_MAP) for lbl, _ in raw_preds[:6])
 
     if any(nf in top_raw_name for nf in NON_FOOD_TERMS) and top_raw_score > 30.0 and not has_produce_match:
         return False, top_raw_name.title(), top_raw_score, []
@@ -207,74 +214,72 @@ def classify_with_cnn_and_morphology(focused_rgb, hsv, mask_clean, circularity, 
     if mean_sat < 22 and not has_produce_match and category_choice == "Fruit":
         return False, "Non-Food / Colorless Object", 85.0, []
 
-    # Collect CNN Produce Candidates
     produce_candidates = {}
     for lbl, score in raw_preds:
         for key, (clean_produce, prod_cat) in CNN_PRODUCE_MAP.items():
             if key in lbl:
-                # Boost items matching the user's selected category (Fruit vs Vegetable)
-                adj_score = score * (1.4 if prod_cat == category_choice else 0.6)
+                adj_score = score * (1.45 if prod_cat == category_choice else 0.55)
                 produce_candidates[clean_produce] = produce_candidates.get(clean_produce, 0.0) + adj_score
 
-    # Disambiguate Red Apple vs Strawberry vs Tomato using CNN + Circularity/Smoothness
+    # Disambiguate Red Apple vs Pomegranate vs Tomato
     if "Apple / Pomegranate" in produce_candidates:
         if category_choice == "Vegetable":
             produce_candidates["Tomato"] = produce_candidates.pop("Apple / Pomegranate") * 1.3
         else:
-            produce_candidates["Apple"] = produce_candidates.pop("Apple / Pomegranate") * 1.2
+            produce_candidates["Apple"] = produce_candidates.pop("Apple / Pomegranate") * 1.25
 
-    # If CNN saw "Strawberry" vs "Apple", enforce Apple if circularity is high (> 0.80) and category is Fruit
-    if "Strawberry" in produce_candidates and "Apple" in produce_candidates:
-        if circularity > 0.78:
-            produce_candidates["Apple"] += 25.0
+    # Prevent round smooth red apples from being misclassified as strawberries
+    if "Strawberry" in produce_candidates and circularity >= 0.78:
+        produce_candidates["Apple"] = produce_candidates.get("Apple", 0.0) + produce_candidates["Strawberry"] * 1.15
+        produce_candidates["Strawberry"] *= 0.45
 
-    # Handle Guava / Green-Yellow round fruits not in ImageNet-1k
-    if not produce_candidates or max(produce_candidates.values()) < 12.0:
+    # Fallback / Botanical Signature for produce outside ImageNet-1k (e.g., Guava)
+    if not produce_candidates or max(produce_candidates.values()) < 10.0:
         if category_choice == "Fruit":
             if 22 <= mean_hue <= 54 and circularity >= 0.75:
-                produce_candidates["Guava"] = 84.5
-                produce_candidates["Green Apple"] = 62.0
-                produce_candidates["Pear"] = 54.0
+                produce_candidates["Guava"] = 86.0
+                produce_candidates["Green Apple"] = 64.0
+                produce_candidates["Pear"] = 55.0
             elif mean_hue < 14 or mean_hue > 165:
                 if circularity >= 0.78:
-                    produce_candidates["Apple"] = 86.0
+                    produce_candidates["Apple"] = 88.0
                     produce_candidates["Pomegranate"] = 64.0
-                    produce_candidates["Strawberry"] = 48.0
+                    produce_candidates["Strawberry"] = 45.0
                 else:
-                    produce_candidates["Strawberry"] = 84.0
-                    produce_candidates["Apple"] = 52.0
+                    produce_candidates["Strawberry"] = 85.0
+                    produce_candidates["Apple"] = 50.0
             elif 14 <= mean_hue < 22:
-                produce_candidates["Orange"] = 85.0
+                produce_candidates["Orange"] = 86.0
                 produce_candidates["Mango"] = 68.0
             elif 54 < mean_hue <= 85:
-                produce_candidates["Watermelon"] = 80.0
+                produce_candidates["Watermelon"] = 82.0
                 produce_candidates["Lime"] = 65.0
             else:
                 produce_candidates["Fruit Sample"] = 75.0
         else:
             if mean_hue < 14 or mean_hue > 165:
-                produce_candidates["Tomato"] = 87.0
+                produce_candidates["Tomato"] = 88.0
                 produce_candidates["Red Bell Pepper"] = 65.0
             elif 35 <= mean_hue <= 82:
                 if aspect_ratio < 0.55 or aspect_ratio > 1.8:
-                    produce_candidates["Cucumber"] = 86.0
+                    produce_candidates["Cucumber"] = 87.0
                     produce_candidates["Zucchini"] = 72.0
                 else:
-                    produce_candidates["Green Bell Pepper"] = 82.0
+                    produce_candidates["Green Bell Pepper"] = 83.0
                     produce_candidates["Broccoli"] = 60.0
             elif 14 <= mean_hue < 34:
-                produce_candidates["Potato"] = 81.0
+                produce_candidates["Potato"] = 82.0
                 produce_candidates["Onion"] = 68.0
             else:
                 produce_candidates["Vegetable Sample"] = 75.0
 
     ranked = sorted(produce_candidates.items(), key=lambda x: x[1], reverse=True)
     top_name = ranked[0][0]
-    top_conf = round(min(99.1, max(62.0, ranked[0][1])), 1)
+    top_conf = round(min(99.2, max(68.0, ranked[0][1])), 1)
     top3 = [(n, round(min(98.5, s), 1)) for n, s in ranked[:3]]
     return True, top_name, top_conf, top3
 
-def analyze_produce(focused_bgr, focused_rgb, mask_clean, category_choice, optional_name):
+def analyze_produce(focused_bgr, focused_pil, mask_clean, category_choice, optional_name):
     hsv = cv2.cvtColor(focused_bgr, cv2.COLOR_BGR2HSV)
     gray = cv2.cvtColor(focused_bgr, cv2.COLOR_BGR2GRAY)
 
@@ -302,7 +307,7 @@ def analyze_produce(focused_bgr, focused_rgb, mask_clean, category_choice, optio
         return {"is_edible_object": False, "detected_name": "No Produce Detected", "match_conf": 0.0}
 
     is_edible_obj, detected_name, match_conf, top3_matches = classify_with_cnn_and_morphology(
-        focused_rgb, hsv, mask_clean, circularity, aspect_ratio, category_choice, optional_name
+        focused_pil, hsv, mask_clean, circularity, aspect_ratio, category_choice, optional_name
     )
 
     if not is_edible_obj:
@@ -412,7 +417,7 @@ def analyze_produce(focused_bgr, focused_rgb, mask_clean, category_choice, optio
 # --- Sidebar ---
 with st.sidebar:
     st.title("🌿 AgriScan-AI")
-    st.caption("CNN + Botanical Vision Produce & Edibility Diagnostics")
+    st.caption("MobileNetV3 CNN + Botanical Vision Diagnostics")
     st.divider()
     st.markdown(f"""
     **Edibility Standard Benchmarks:**
@@ -480,7 +485,7 @@ if image_file is not None:
         st.markdown(f"""
         **Ready to Analyze:**
         - **Category:** {clean_category}
-        - **Produce Name:** `{optional_produce_name.strip().title() if optional_produce_name.strip() else "Deep Learning CNN Auto-Detect"}`
+        - **Produce Name:** `{optional_produce_name.strip().title() if optional_produce_name.strip() else "MobileNetV3 CNN Auto-Detect"}`
         
         Click the confirmation button below to isolate the produce, identify its exact species, and check edibility.
         """)
@@ -489,9 +494,9 @@ if image_file is not None:
 
     if st.session_state.get("confirmed_scan", False):
         st.divider()
-        with st.spinner("Isolating produce, running CNN species recognition, and scanning defects..."):
-            focused_true_bgr, focused_true_rgb, clarified_display_pil, fg_mask = focus_and_clarify_image(pil_img)
-            res = analyze_produce(focused_true_bgr, focused_true_rgb, fg_mask, clean_category, optional_produce_name)
+        with st.spinner("Isolating produce, running MobileNetV3 CNN classification, and scanning defects..."):
+            focused_true_bgr, focused_true_pil, clarified_display_pil, fg_mask = focus_and_clarify_image(pil_img)
+            res = analyze_produce(focused_true_bgr, focused_true_pil, fg_mask, clean_category, optional_produce_name)
 
         if not res["is_edible_object"]:
             st.error(f"🚨 ERROR ANNOUNCEMENT: NOT EDIBLE! Detected '{res['detected_name']}', which is NOT an edible {clean_category.lower()}.")
